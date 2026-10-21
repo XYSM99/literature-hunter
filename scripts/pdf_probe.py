@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 try:
     from pypdf import PdfReader
@@ -88,12 +89,22 @@ def collect(targets):
     return [read_info(f) for f in files if os.path.exists(f)]
 
 
-def print_table(rows):
+def disp_width(s):
+    """终端显示宽度：中日韩全角字符占 2 列，用 len() 算会让中文列错位。"""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def pad(s, width):
+    """按显示宽度右补空格。"""
+    return s + " " * max(0, width - disp_width(s))
+
+
+def print_table(rows, note=None):
     headers = ["文件", "页数", "大小", "首页开头", "版本年份", "完整性"]
-    widths = [max([len(r["file"]) for r in rows] + [len(headers[0])]),
+    widths = [max([disp_width(r["file"]) for r in rows] + [disp_width(headers[0])]),
               8, 10, 40, 10, 8]
     line = "  ".join("-" * w for w in widths)
-    print("  ".join(h.ljust(w) for h, w in zip(headers, widths)))
+    print("  ".join(pad(h, w) for h, w in zip(headers, widths)))
     print(line)
     for r in rows:
         cells = [
@@ -104,12 +115,13 @@ def print_table(rows):
             str(r["year"] or "-"),
             "完整" if r["complete"] else "不完整",
         ]
-        print("  ".join(c.ljust(w) for c, w in zip(cells, widths)))
+        print("  ".join(pad(c, w) for c, w in zip(cells, widths)))
     bad = [r for r in rows if not r["complete"]]
     if bad:
-        print("\n需重下载（不完整）：")
+        emit = note or (lambda m: print(m))
+        emit("\n需重下载（不完整）：")
         for r in bad:
-            print("  - %s%s" % (r["file"], "  (%s)" % r["error"] if r["error"] else ""))
+            emit("  - %s%s" % (r["file"], "  (%s)" % r["error"] if r["error"] else ""))
 
 
 def main():
@@ -120,15 +132,21 @@ def main():
                     help="按首页识别到的年份重命名为 <原名>_<年份>.pdf")
     args = ap.parse_args()
 
+    # json 模式下 stdout 必须是纯 JSON，任何辅助信息都改走 stderr
+    json_mode = args.format == "json"
+
+    def note(msg):
+        print(msg, file=sys.stderr if json_mode else sys.stdout)
+
     rows = collect(args.targets)
     if not rows:
-        print("未找到任何 PDF")
+        note("未找到任何 PDF")
         return 1
 
-    if args.format == "json":
+    if json_mode:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
     else:
-        print_table(rows)
+        print_table(rows, note=note)
 
     if args.rename_by_year:
         renamed = 0
@@ -139,13 +157,13 @@ def main():
             new = "%s_%d%s" % (stem, r["year"], ext)
             if not os.path.exists(new):
                 os.rename(r["path"], new)
-                print("renamed -> %s" % os.path.basename(new))
+                note("renamed -> %s" % os.path.basename(new))
                 renamed += 1
-        print("重命名 %d 个" % renamed)
+        note("重命名 %d 个" % renamed)
 
     incomplete = sum(1 for r in rows if not r["complete"])
-    print("\n合计 %d 个文件，%d 个不完整" % (len(rows), incomplete))
-    print("声明：本 skill 仅用于检索公开信息，使用时请遵守各网站的服务条款。")
+    note("\n合计 %d 个文件，%d 个不完整" % (len(rows), incomplete))
+    note("声明：本 skill 仅用于检索公开信息，使用时请遵守各网站的服务条款。")
     return 0 if incomplete == 0 else 1
 
 

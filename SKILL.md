@@ -75,7 +75,9 @@ python scripts/pdf_probe.py ./downloads --format table
 - 先探测、后下载：一律先用小范围请求验证可达性，确认无误再取全文
 - 单线程、串行抓取，保留请求间隔，避免给目标站点造成压力
 - 下载后必须校验完整性，PDF 检查文件尾部是否有 `%%EOF`
-- 中断一律用断点续传补齐，不重头重来
+- 中断优先用断点续传补齐；**但服务器不支持 Range 时必须整份重下**——
+  盲目 `-C -` 会卡在残缺状态（curl 报 exit 33），脚本已自动识别并切换
+- 续传写入前确认响应是 206；若服务器忽略 Range 返回 200 全量，必须从头覆盖写，否则文件损坏
 
 ### Step 5 — 结构化输出
 
@@ -108,6 +110,8 @@ python scripts/pdf_probe.py ./downloads --format table
 | https 返回 403 | 换 http 协议重试（不少政府站点 CDN 对 https 更严格） |
 | 站点整站不可达 | 查机构知识库记录号、同域镜像域名、REST 化服务源 |
 | 文件只有部分下载 | `Range` 续传补齐，检查 `%%EOF` |
+| 续传无效（curl exit 33 / 文件不增长） | 服务器不支持 Range，去掉 `-C -` 整份重下 |
+| 续传后文件变大但仍损坏 | 服务器忽略 Range 返回了 200 全量却被追加写入，改为从头覆盖写 |
 | 历史版本找不回 | 从现行版页面找 previous versions 链接 → 机构知识库 → 年份目录命名规律 |
 | 不知文件是否完整 | `python scripts/pdf_probe.py <file>` |
 | 需要建清单表 | 套 `references/output-format.md` 模板 |

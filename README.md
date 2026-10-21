@@ -21,11 +21,16 @@
 把整个目录放进 WorkBuddy 的技能目录：
 
 ```bash
-git clone https://github.com/<你的用户名>/literature-hunter.git \
+# macOS / Linux
+git clone https://github.com/XYSM99/literature-hunter.git \
     ~/.workbuddy/skills/literature-hunter
+
+# Windows PowerShell（注意：PowerShell 不展开 ~，要写完整路径）
+git clone https://github.com/XYSM99/literature-hunter.git \
+    C:\Users\<你的用户名>\.workbuddy\skills\literature-hunter
 ```
 
-重启会话即可触发。触发语示例：
+也可以直接下载 ZIP 解压到上面的目录。重启会话即可触发。触发语示例：
 
 - 「帮我查某某机构某某手册有几个版本，并把原文下载下来」
 - 「把这份指南的历年版本整理成对照表」

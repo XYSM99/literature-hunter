@@ -60,19 +60,24 @@ def candidate_urls(url):
     return ["http://" + bare, "https://" + bare]
 
 
-def build_req(url, headers, pos=None):
+def build_req(url, headers, rng=None):
+    """rng 为 None 时不发 Range；(start,) 表示 bytes=start-；(start, end) 表示闭区间。"""
     h = dict(headers) if headers else {}
-    if pos:
-        h["Range"] = "bytes=%d-" % pos
+    if rng:
+        h["Range"] = "bytes=%d-" % rng[0] if len(rng) == 1 else "bytes=%d-%d" % (rng[0], rng[1])
     return urllib.request.Request(url, headers=h)
 
 
 def try_open(url, pos=None, timeout=TIMEOUT):
-    """依次轮换协议与请求头组合，返回 (response, headers_used, None)。"""
+    """依次轮换协议与请求头组合，返回 (response, headers_used, err)。
+
+    err 取值：None（成功）/ "done"（416，说明已下完）/ "fail"（全部组合都失败）。
+    """
     for u in candidate_urls(url):
         for hs in HEADER_SETS:
             try:
-                r = urllib.request.urlopen(build_req(u, hs, pos), timeout=timeout)
+                r = urllib.request.urlopen(build_req(u, hs, (pos,) if pos else None),
+                                           timeout=timeout)
                 return r, hs, None
             except urllib.error.HTTPError as e:
                 if e.code == 416:
@@ -103,34 +108,54 @@ def total_from(resp):
 
 
 def probe(url, timeout=TIMEOUT):
-    """小范围探测：确认可达性与总长度。返回 (total, headers_used)。"""
+    """小范围探测：确认可达性、总长度，以及服务器是否支持 Range。
+
+    返回 (total, headers_used, supports_range)。
+    顺序：先发 Range: bytes=0-99 只取前 100 字节（最省流量）；
+    服务器忽略 Range 时返回 200，同样能拿到 Content-Length；
+    403/405/501 等明确拒绝 Range 时，退成普通 GET 再试一次。
+    """
     for u in candidate_urls(url):
         for hs in HEADER_SETS:
+            tag = "默认头" if not hs else "自定义头"
             try:
-                r = urllib.request.urlopen(
-                    build_req(u, hs, None) if not hs else build_req(u, hs, None),
-                    timeout=timeout)
+                r = urllib.request.urlopen(build_req(u, hs, (0, 99)), timeout=timeout)
                 with r:
+                    total = total_from(r)
+                    ctype = (r.headers.get("Content-Type") or "").lower()
+                    status = getattr(r, "status", None)
                     r.read(1)
+                if total:
+                    log("  [probe] %s / %s -> %s bytes (%s) [%s]" % (
+                        u, tag, total, ctype or "未知类型",
+                        "支持续传" if status == 206 else "不支持续传"))
+                    return total, hs, status == 206
+                log("  [probe] %s / %s -> 未返回长度信息" % (u, tag))
             except urllib.error.HTTPError as e:
-                # 403/405 等对 Range 的拒绝不代表不可用，改用普通 GET 再试一次
-                if e.code in (403, 405):
-                    try:
-                        r = urllib.request.urlopen(
-                            urllib.request.Request(u, headers=hs or {}), timeout=timeout)
-                        with r:
-                            total = total_from(r)
-                            ctype = (r.headers.get("Content-Type") or "").lower()
-                        if total:
-                            log("  [probe] %s -> %s bytes (%s)" % (u, total, ctype or "未知类型"))
-                            return total, hs
-                    except Exception:
-                        debug_trace()
-                log("  [probe] %s -> HTTP %s" % (u, e.code))
+                if e.code not in (403, 405, 400, 501):
+                    log("  [probe] %s / %s -> HTTP %s" % (u, tag, e.code))
+                # 拒绝或不支持 Range：改用普通 GET 再试一次
+                try:
+                    r = urllib.request.urlopen(
+                        urllib.request.Request(u, headers=dict(hs)), timeout=timeout)
+                    with r:
+                        total = total_from(r)
+                        ctype = (r.headers.get("Content-Type") or "").lower()
+                        r.read(1)
+                    if total:
+                        log("  [probe] %s / %s -> %s bytes (%s) [普通GET]" % (
+                            u, tag, total, ctype or "未知类型"))
+                        return total, hs, False
+                except urllib.error.HTTPError as e2:
+                    log("  [probe] %s / %s -> 普通GET HTTP %s" % (u, tag, e2.code))
+                except Exception as e2:
+                    log("  [probe] %s / %s -> 普通GET %s" % (u, tag, type(e2).__name__))
+                    debug_trace()
             except Exception as e:
-                log("  [probe] %s -> %s" % (type(e).__name__, u))
+                log("  [probe] %s / %s -> %s" % (u, tag, type(e).__name__))
+                debug_trace()
             time.sleep(INTERVAL)
-    return None, None
+    return None, None, False
 
 
 def looks_like_pdf(path):
@@ -162,23 +187,39 @@ def curl_path():
     return exe
 
 
-def curl_download(url, path, total=None):
-    """回退方案：系统 curl + 断点续传循环。"""
+def curl_download(url, path, total=None, resume=True):
+    """回退方案：系统 curl + 断点续传循环。
+
+    关键：curl 的 `-C -` 在服务器不支持字节范围时会直接报错退出（exit 33，
+    "HTTP server doesn't seem to support byte ranges"），文件永远停在残缺状态。
+    因此每轮都比对文件大小：只要一轮下来没有任何增长，就判定续传无效，
+    下一轮去掉 `-C -` 整份重下。
+    """
     exe = curl_path()
     if not exe:
         return False
     for _ in range(MAX_RESUME):
-        subprocess.run([exe, "-sL", "--max-time", "300", "-C", "-", "-o", path, url],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        before = os.path.getsize(path) if os.path.exists(path) else 0
+        cmd = [exe, "-sL", "--max-time", "300"]
+        if resume and before > 0:
+            cmd += ["-C", "-"]
+        cmd += ["-o", path, url]
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if is_complete(path, total):
             return True
+        after = os.path.getsize(path) if os.path.exists(path) else 0
+        if resume and (proc.returncode != 0 or after <= before):
+            log("  [warn] curl 续传无效（exit %d，%d -> %d 字节），改为整份重下"
+                % (proc.returncode, before, after))
+            resume = False       # 下一轮去掉 -C -
+            continue
         time.sleep(INTERVAL)
     return False
 
 
 def download(url, path):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    total, hs = probe(url)
+    total, hs, supports_range = probe(url)
     if not total:
         log("  Python 层探测失败，回退系统 curl")
         return curl_download(url, path)
@@ -193,10 +234,16 @@ def download(url, path):
             break
         if resp is None:
             log("  [warn] Python 层本轮失败，交给 curl 续传 (%d/%d)" % (attempt + 1, MAX_RESUME))
-            if curl_download(url, path, total):
+            if curl_download(url, path, total, resume=supports_range):
                 break
             continue
         try:
+            # 服务器若忽略 Range 会返回 200 全量，此时追加写必然损坏文件，
+            # 必须改成从头覆盖；只有确认 206 才允许续写。
+            status = getattr(resp, "status", None)
+            if pos and status != 206:
+                log("  [warn] 服务器忽略 Range（返回 %s），本轮整份重下" % status)
+                pos = 0
             mode = "ab" if pos else "wb"
             with resp, open(path, mode) as f:
                 while True:
@@ -216,6 +263,10 @@ def download(url, path):
     ok = is_complete(path, total)
     log("[%s] %s size=%d/%d %s" % (
         os.path.basename(path), "OK" if ok else "INCOMPLETE", size, total, path))
+    if not ok:
+        log("  [提示] 仍未下载完整。常见原因：① 站点对匿名请求限流；"
+            "② 服务器不支持断点续传且单次连接被中断；③ URL 实际返回的是错误页（非 PDF）。"
+            "建议：换用 --mirror-file 指定镜像地址，或稍后重试。")
     return ok
 
 
